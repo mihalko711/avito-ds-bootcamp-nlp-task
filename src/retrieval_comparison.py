@@ -15,9 +15,39 @@ from src.retrievers.hybrid import HybridRetriever
 from src.retrievers.geo_first import GeoFirstRetriever
 
 class RetrievalComparison:
-    """Orchestrate existing retrievers; tune on val, evaluate test, export benchmark."""
+    """Готовит кеши ретриверов, сравнивает стратегии на val/test и экспортирует benchmark-ответ."""
 
-    def __init__(self, *, repo_path, data_path, dense_index_dir, dense_models, seed, sample_seed, n_val, n_test, ns, ks, select_k, query_batch_size, dense_batch_size, bm25_lemmatize, score_order, quality_depth, quality_weights, artifacts, dense_max_length=128, build_dense_indices=True):
+    def __init__(
+        self, *, repo_path, data_path, dense_index_dir, dense_models, seed,
+        sample_seed, n_val, n_test, ns, ks, select_k, query_batch_size,
+        dense_batch_size, bm25_lemmatize, score_order, quality_depth,
+        quality_weights, artifacts, dense_max_length=128,
+        build_dense_indices=True,
+    ):
+        """Сохранить настройки эксперимента и проверить окружение/пути.
+
+        Args:
+            repo_path: Корень репозитория с исходным кодом.
+            data_path: Путь к train.parquet.
+            dense_index_dir: Каталог индексов dense-моделей; None — найти или построить.
+            dense_models: Имена dense-моделей для сравнения, например ``["giga", "bge"]``.
+            seed: Seed разбиения запросов на train/val/test.
+            sample_seed: Seed выборки контекстов внутри val и test.
+            n_val: Максимальное число контекстов для валидации.
+            n_test: Максимальное число контекстов для теста.
+            ns: Глубины исходного отбора кандидатов для сравнения.
+            ks: Значения K для расчёта Recall@K.
+            select_k: K, по которому выбираются настройки на val.
+            query_batch_size: Число запросов в одном батче обработки.
+            dense_batch_size: Размер батча кодирования текстов dense-моделью.
+            bm25_lemmatize: Включить лемматизацию в BM25-токенизаторе.
+            score_order: Порядок dense/BM25-скоров при лексикографическом ранжировании.
+            quality_depth: Глубина списка, внутри которой применяются фичи качества.
+            quality_weights: Проверяемые веса фич рейтинга, отзывов и контактов.
+            artifacts: Каталог кешей и результатов эксперимента.
+            dense_max_length: Максимальная длина текста dense-модели в токенах.
+            build_dense_indices: Построить отсутствующие dense-индексы на train-корпусе.
+        """
         self.root = repo_path
         self.data_path = data_path
         self.dense_index_dir = dense_index_dir
@@ -42,6 +72,7 @@ class RetrievalComparison:
 
 
     def _setup(self):
+        """Проверить GPU для dense-моделей, схему данных и каталог индексов."""
         if self.dense_models:
             import torch
             from src.retrievers.dense import DenseRetriever
@@ -83,10 +114,12 @@ class RetrievalComparison:
         print('Код:', self.root, 'Данные:', self.data_path, 'Индексы:', self.dense_index_dir)
 
     def read_item_text(self, column):
+        """Прочитать одно текстовое поле, оставив последнюю запись каждого item_id."""
         frame = pl.scan_parquet(self.data_path).select('item_id', column).unique(subset='item_id', keep='last', maintain_order=True).sort('item_id').collect()
         return pd.DataFrame(frame.to_dict(as_series=False))
 
     def prepare_data(self):
+        """Построить query-split, цели, центры локаций и train-нормировки фич."""
         from src.geo import location_centers
         self.query_cols = ['search_query', 'search_location_id', 'search_is_delivery_search', 'search_infm_params_text', 'search_category']
         self.geo_cols = ['item_location_id', 'item_latitude', 'item_longitude']
@@ -158,10 +191,12 @@ class RetrievalComparison:
         gc.collect()
 
     def prepare_quality(self):
+        """Собрать ограниченные сигналы рейтинга, отзывов и доступности контакта."""
         self.quality = pd.DataFrame(index=self.items.item_id)
         rating = self.items.item_rating.to_numpy(dtype=float)
         counts = self.items.item_rating_reviews_count.to_numpy(dtype=float)
         n = np.nan_to_num(np.maximum(counts, 0), nan=0)
+        # Сглаживание не даёт единичному отзыву приравнять рейтинг к надёжному среднему.
         adjusted = (n * np.nan_to_num(np.clip(rating, 0, 5), nan=self.rating_mean) + 20 * self.rating_mean) / (n + 20)
         self.quality['rating'] = np.where(np.isfinite(rating), (adjusted - self.rating_mean) / 5, 0)
         self.quality['reviews'] = np.where(np.isfinite(counts), np.clip(np.log1p(n) / self.review_scale, 0, 1), 0)
@@ -171,15 +206,28 @@ class RetrievalComparison:
         self.quality['all'] = self.quality.mean(axis=1)
 
     def cache_path(self, kind, split, start, name='pool'):
+        """Вернуть путь к кешу по типу результата, части данных, батчу и модели."""
         return self.cache / kind / name / split / f'{start:07d}.parquet'
 
     def save_frame(self, frame, path):
+        """Атомарно записать таблицу Parquet с временным файлом."""
         path.parent.mkdir(parents=True, exist_ok=True)
         temporary = path.with_suffix('.tmp.parquet')
-        pl.DataFrame(frame.to_dict(orient="list"), schema_overrides={c: pl.String for c in ("item_id", "query_id") if c in frame}).write_parquet(temporary)
+        columns = frame.to_dict(orient='list')
+        # Polars не выводит String из смеси строк и float NaN; в object-колонках NaN — это null.
+        for name in frame.select_dtypes(include=['object', 'string']).columns:
+            values = []
+            for value in columns[name]:
+                missing = pd.isna(value)
+                values.append(None if isinstance(missing, (bool, np.bool_)) and missing else value)
+            columns[name] = values
+        # Пустые кадры не сохраняют pandas dtype, поэтому строковые ID задаём явно.
+        schema = {name: pl.String for name in ('item_id', 'query_id') if name in frame}
+        pl.DataFrame(columns, schema_overrides=schema).write_parquet(temporary)
         temporary.replace(path)
 
     def read_frame(self, path):
+        """Прочитать кеш Parquet, сохранив строковые ID и целочисленный query_index."""
         frame = pd.DataFrame(pl.read_parquet(path).to_dict(as_series=False))
         for col in ('item_id', 'query_id'):
             if col in frame:
@@ -189,11 +237,13 @@ class RetrievalComparison:
         return frame
 
     def prepare_cache(self):
+        """Зафиксировать подпись эксперимента и создать/переиспользовать геопулы."""
         self.sources = {'bm25_title': ('item_title_raw', 'search_query'), 'bm25_description': ('item_description_raw', 'search_query'), 'bm25_infm': ('item_infm_params_text', 'search_infm_params_text')}
         self.names = list(self.sources) + self.dense_models
         self.order = [name for name in self.score_order if name in self.names]
         assert set(self.order) == set(self.names) and len(self.order) == len(self.names)
         stat = self.data_path.stat()
+        # Любое изменение входных данных, исходников или индекса создаёт отдельный кеш.
         code_hash = hashlib.sha256(b''.join((p.read_bytes() for p in sorted((self.root / 'src').rglob('*.py'))))).hexdigest()
         self.signature = dict(data=[str(self.data_path.resolve()), stat.st_size, stat.st_mtime_ns], queries={s: hashlib.sha256(pd.util.hash_pandas_object(q, index=True).to_numpy().tobytes()).hexdigest() for s, q in self.queries.items()}, code=code_hash, dense=self.dense_metadata, models=self.names, lemma=self.bm25_lemmatize, max_n=max(self.ns), batch=self.query_batch_size)
         self.cache = self.artifacts / hashlib.sha256(json.dumps(self.signature, sort_keys=True).encode()).hexdigest()[:16]
@@ -209,6 +259,7 @@ class RetrievalComparison:
         self.hybrid = HybridRetriever(distance_only=True).fit(self.items)
 
     def build(self, kinds=("retrieval", "scores")):
+        """Посчитать отсутствующие текстовые выдачи или скоры геопул, по одной модели за раз."""
         if self.dense_models:
             from src.retrievers.dense import DenseRetriever
             import torch
@@ -251,18 +302,21 @@ class RetrievalComparison:
                 torch.cuda.empty_cache()
 
     def late_rerank(self, base, feature, weight):
+        """Сместить порядок только внутри quality_depth первых кандидатов."""
         if feature == 'none' or weight == 0 or base.empty:
             return base
         head = base.loc[base['rank'] <= self.quality_depth].copy()
         tail = base.loc[base['rank'] > self.quality_depth].copy()
         depth = head.groupby('query_index')['rank'].transform('max')
         signal = self.quality[feature].reindex(head.item_id).to_numpy()
+        # Нормированный исходный ранг задаёт базовый приоритет, feature добавляет малую поправку.
         head['utility'] = 1 - (head['rank'] - 1) / np.maximum(depth - 1, 1) + weight * signal
         head = head.sort_values(['query_index', 'utility', 'rank'], ascending=[True, False, True], kind='stable')
         head['rank'] = head.groupby('query_index').cumcount() + 1
         return pd.concat([head, tail], ignore_index=True).sort_values(['query_index', 'rank'])
 
     def measure(self, result, target_sets):
+        """Посчитать макро-Recall@K для всех запросов, включая пустые выдачи."""
         output = np.zeros((len(target_sets), len(self.ks)))
         for qi, g in result.groupby('query_index', sort=False):
             qi = int(qi)
@@ -271,9 +325,13 @@ class RetrievalComparison:
         return output
 
     def evaluate(self, split, configs):
+        """Оценить конфигурации на сплите, переиспользуя кеш моделей и геопулов."""
+        from tqdm.auto import tqdm
+
         arrays = {key: np.zeros((len(self.queries[split]), len(self.ks))) for key in configs}
         pool_stats = {key: np.zeros((len(self.queries[split]), 2)) for key in configs}
-        for start in range(0, len(self.queries[split]), self.query_batch_size):
+        batches = range(0, len(self.queries[split]), self.query_batch_size)
+        for start in tqdm(batches, desc=f'Оценка {split}', unit='батч'):
             q = self.queries[split].iloc[start:start + self.query_batch_size]
             truth = self.targets[split][start:start + len(q)]
             retrieved = {name: self.read_frame(self.cache_path('retrieval', split, start, name)) for name in self.names}
@@ -299,6 +357,7 @@ class RetrievalComparison:
                         ids = set(g.item_id)
                         stats[qi] = (len(ids & truth[qi]) / len(truth[qi]), len(ids))
                     bases[pair] = (base, stats)
+                # Один и тот же base для пары (подход, N) используется всеми вариантами фич.
                 base, stats = bases[pair]
                 key = (approach, n, feature, weight)
                 arrays[key][start:start + len(q)] = self.measure(self.late_rerank(base, feature, weight), truth)
@@ -313,11 +372,14 @@ class RetrievalComparison:
         return (pd.DataFrame(rows), arrays)
 
     def validate(self):
+        """Выбрать глубину каждого подхода и веса фич только по validation."""
         approaches = ['text_then_geo', 'geo_then_tuple']
         baseline_configs = [(a, n, 'none', 0.0) for a in approaches for n in self.ns]
+        print('Validation: подбор глубины базовых подходов')
         self.val_base, _ = self.evaluate('val', baseline_configs)
         self.best_n = {a: int(self.val_base.loc[self.val_base.approach == a].sort_values([f'Recall@{self.select_k}', 'N'], ascending=[False, True]).iloc[0].N) for a in approaches}
         feature_configs = [(a, self.best_n[a], f, w) for a in approaches for f in ['rating', 'reviews', 'phone', 'messages', 'all'] for w in self.quality_weights]
+        print('Validation: подбор весов дополнительных признаков')
         self.val_features, _ = self.evaluate('val', feature_configs)
         self.chosen = self.val_features.sort_values([f'Recall@{self.select_k}', 'weight'], ascending=[False, True]).drop_duplicates(['approach', 'feature'])
         self.selected = [(a, self.best_n[a], 'none', 0.0) for a in approaches]
@@ -330,6 +392,7 @@ class RetrievalComparison:
         return (self.val_base, self.chosen)
 
     def interval(self, delta):
+        """Оценить 95% интервал прироста кластерным bootstrap по текстам запросов."""
         totals = np.bincount(self.group_ids, weights=delta)
         rng = np.random.default_rng(123)
         estimates = []
@@ -339,6 +402,7 @@ class RetrievalComparison:
         return np.quantile(estimates, [0.025, 0.975])
 
     def test(self):
+        """Проверить выбранные на val конфигурации и сохранить test-метрики/кеш."""
         self.comparison, self.per_query = self.evaluate('test', self.selected)
         self.group_ids = pd.factorize(self.queries['test'].search_query.fillna(''))[0]
         self.group_count = np.bincount(self.group_ids)
@@ -364,10 +428,10 @@ class RetrievalComparison:
 
     def benchmark(self, *, items_path, queries_path, index_dir, build_missing_indexes,
                   approach, n, feature, weight, output_path):
-        """Run fixed configuration on benchmark corpus; save validated answer.csv.
+        """Запустить выбранную конфигурацию на benchmark-корпусе и сохранить answer.csv.
 
-        Uses train location centers and feature statistics from prepare_data().
-        Benchmark indices are separate from train indices. Models load one at a time.
+        Центры и статистики фич берутся из train; dense-индексы benchmark строятся отдельно.
+        Модели загружаются по одной, query_id и item_id проверяются перед записью.
         """
         import copy
         if approach not in {'text_then_geo', 'geo_then_tuple'}:
@@ -377,6 +441,7 @@ class RetrievalComparison:
         if not np.isfinite(weight) or weight < 0:
             raise ValueError('Weight must be finite and nonnegative')
         run = copy.copy(self)
+        # Переиспользуем train-центры/масштабы, но строим независимые индексы benchmark items.
         run.data_path = Path(items_path)
         run.dense_index_dir = Path(index_dir)
         if self.dense_models and run.dense_index_dir.resolve() == Path(self.dense_index_dir).resolve():
@@ -441,7 +506,7 @@ class RetrievalComparison:
 
 
 def write_answer(query_ids, predictions, item_ids, output_path):
-    """Validate identifiers without casting or changing case; write UTF-8 CSV."""
+    """Проверить покрытие query_id и item_id, затем атомарно записать CSV UTF-8 без индекса."""
     import re
     if len(query_ids) != len(predictions) or len(set(query_ids)) != len(query_ids):
         raise ValueError('Exactly one prediction list per unique query_id is required')
@@ -461,6 +526,6 @@ def write_answer(query_ids, predictions, item_ids, output_path):
     restored = pd.read_csv(temporary,dtype=str,keep_default_na=False)
     if list(restored.columns) != ['query_id','answer'] or not restored.equals(answer):
         raise ValueError('CSV round-trip validation failed')
-    temporary.replace(path)
+    temporary.replace(path)  # Готовый файл появляется только после успешной проверки round-trip.
     print(f'Saved {len(answer)} queries: {path}')
     return answer
