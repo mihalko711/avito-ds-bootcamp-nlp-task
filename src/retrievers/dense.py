@@ -158,7 +158,7 @@ class DenseRetriever(Retriever):
         self.fitted_params_ = self.get_params(deep=False).copy()
         return self
 
-    def retrieve(self, queries: pd.DataFrame, *, k: int) -> pd.DataFrame:
+    def _check_index(self):
         check_is_fitted(self, ["index_", "item_ids_"])
         self._validate_params()
         # Эти настройки меняют пространство векторов: после их изменения
@@ -166,6 +166,9 @@ class DenseRetriever(Retriever):
         for name in ("model", "revision", "max_length", "query_instruction", "dtype"):
             if getattr(self, name) != self.fitted_params_[name]:
                 raise ValueError(f"{name} changed after fit; rebuild the index.")
+
+    def retrieve(self, queries: pd.DataFrame, *, k: int) -> pd.DataFrame:
+        self._check_index()
         if isinstance(k, bool) or not isinstance(k, int) or k < 1:
             raise ValueError("k must be a positive integer.")
         texts = self._texts(queries, self.query_text_column)
@@ -185,6 +188,33 @@ class DenseRetriever(Retriever):
                     for rank, (doc_i, score) in enumerate(zip(doc_indices, doc_scores), 1)
                 )
         return pd.DataFrame.from_records(rows, columns=RESULT_COLUMNS)
+
+    def score_candidates(self, queries: pd.DataFrame, candidates: pd.DataFrame) -> np.ndarray:
+        """Cosine для заданных пар: кодируем запросы, векторы items берём из FAISS.
+
+        Объявления вне индекса (в том числе с пустым заголовком) и пустые
+        запросы дают NaN. Даже отрицательные cosine сохраняются.
+        """
+        self._check_index()
+        query_indices = self._candidate_query_indices(queries, candidates)
+        texts = self._texts(queries, self.query_text_column)
+        positions = pd.Index(self.item_ids_).get_indexer(candidates.item_id)
+        scores = np.full(len(candidates), np.nan)
+        active = [i for i in np.unique(query_indices[positions >= 0]) if texts[i].strip()]
+        if not active:
+            return scores
+        if not hasattr(self, "encoder_"):
+            self.encoder_ = self._load_encoder()
+        for start in range(0, len(active), self.batch_size):
+            batch = active[start:start + self.batch_size]
+            vectors = self._encode([texts[i] for i in batch], query=True)
+            for query_i, vector in zip(batch, vectors):
+                rows = np.flatnonzero((query_indices == query_i) & (positions >= 0))
+                for offset in range(0, len(rows), 4096):
+                    selected = rows[offset:offset + 4096]
+                    item_vectors = self.index_.reconstruct_batch(positions[selected])
+                    scores[selected] = item_vectors @ vector
+        return scores
 
     def save(self, directory: str | Path) -> None:
         """Сохранить индекс (включая векторы) и настройки; без весов модели."""

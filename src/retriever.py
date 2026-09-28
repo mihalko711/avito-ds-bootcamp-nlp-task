@@ -4,6 +4,7 @@ from abc import ABC, abstractmethod
 from typing import Self
 
 import pandas as pd
+import numpy as np
 from sklearn.base import BaseEstimator
 
 
@@ -54,3 +55,25 @@ class Retriever(BaseEstimator, ABC):
     def retrieve(self, queries: pd.DataFrame, *, k: int) -> pd.DataFrame:
         """Вернуть до k найденных объявлений для каждого запроса."""
         ...
+
+    def score_candidates(self, queries: pd.DataFrame, candidates: pd.DataFrame) -> np.ndarray:
+        """Посчитать скоры заданных пар без отбора top-k (опциональный метод).
+
+        candidates содержит query_index (позицию в queries) и item_id.
+        Возвращается массив в порядке строк candidates, включая повторы.
+        NaN означает отсутствие сигнала: например, нет вектора объявления
+        или запрос пуст. Нулевой BM25 при отсутствии совпадений — валидный скор.
+        Статистики и векторы берутся из общего индекса, новый fit не выполняется.
+        """
+        raise NotImplementedError(f"{type(self).__name__} does not support candidate scoring.")
+
+    @staticmethod
+    def _candidate_query_indices(queries: pd.DataFrame, candidates: pd.DataFrame) -> np.ndarray:
+        if missing := {"query_index", "item_id"}.difference(candidates.columns):
+            raise ValueError(f"Missing candidate columns: {sorted(missing)}")
+        if candidates[["query_index", "item_id"]].isna().any().any():
+            raise ValueError("Candidate query_index and item_id must be non-null.")
+        positions = candidates.query_index
+        if not (positions.between(0, len(queries) - 1) & positions.mod(1).eq(0)).all():
+            raise ValueError("Candidate query_index must be a position in queries.")
+        return positions.to_numpy(dtype=int)

@@ -150,3 +150,25 @@ class BM25Retriever(Retriever):
                     rank += 1
 
         return pd.DataFrame.from_records(rows, columns=_RESULT_COLUMNS)
+
+    def score_candidates(self, queries: pd.DataFrame, candidates: pd.DataFrame) -> np.ndarray:
+        """BM25 общего корпуса для заданных пар; нулевые совпадения сохраняются."""
+        check_is_fitted(self, ["index_", "item_ids_", "tokenizer_"])
+        if self.query_text_column not in queries:
+            raise ValueError(f"Missing query column: {self.query_text_column}")
+        query_indices = self._candidate_query_indices(queries, candidates)
+        positions = pd.Index(self.item_ids_).get_indexer(candidates.item_id)
+        scores = np.full(len(candidates), np.nan)
+        for query_i in np.unique(query_indices):
+            rows = np.flatnonzero((query_indices == query_i) & (positions >= 0))
+            if not len(rows):
+                continue
+            text = queries[self.query_text_column].iloc[query_i]
+            tokens = self.tokenizer_.tokenize(
+                ["" if pd.isna(text) else text], update_vocab=False,
+                allow_empty=False, show_progress=False,
+            )[0]
+            # BM25S суммирует postings по общему индексу; сохраняем только
+            # скоры запрошенных объявлений, без глобального top-k.
+            scores[rows] = self.index_.get_scores_from_ids(tokens)[positions[rows]] if tokens else 0
+        return scores

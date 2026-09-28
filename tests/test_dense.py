@@ -71,6 +71,25 @@ class DenseRetrieverTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "positive integer"):
             model.retrieve(self.queries, k=0)
 
+    def test_candidate_scores_use_saved_item_vectors_in_pair_order(self):
+        model = DenseRetriever(show_progress=False).fit(self.items)
+        pairs = pd.DataFrame({"query_index": [2, 0, 0, 1, 0, 0],
+                              "item_id": ["C", "B", "A", "A", "blank", "unknown"]}, index=[9] * 6)
+        self.encoder.calls.clear()
+        with tempfile.TemporaryDirectory() as directory:
+            model.save(directory)
+            restored = DenseRetriever.load(directory, device="cpu")
+            scores = restored.score_candidates(self.queries, pairs)
+        np.testing.assert_allclose(scores[:3], [-.8, .6, .8], atol=1e-6)
+        self.assertTrue(np.isnan(scores[3:]).all())
+        self.assertEqual(self.encoder.calls[0][0], ["q", "q"])
+        self.assertEqual(len(restored.score_candidates(self.queries, pairs.iloc[:0])), 0)
+        with self.assertRaisesRegex(ValueError, "position"):
+            restored.score_candidates(self.queries, pairs.assign(query_index=99))
+        restored.max_length += 1
+        with self.assertRaisesRegex(ValueError, "changed after fit"):
+            restored.score_candidates(self.queries, pairs)
+
 
 if __name__ == "__main__":
     unittest.main()
