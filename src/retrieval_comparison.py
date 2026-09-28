@@ -17,7 +17,7 @@ from src.retrievers.geo_first import GeoFirstRetriever
 class RetrievalComparison:
     """Orchestrate existing retrievers; tune on val, evaluate test, export benchmark."""
 
-    def __init__(self, *, repo_path, data_path, dense_index_dir, dense_models, seed, sample_seed, n_val, n_test, ns, ks, select_k, query_batch_size, dense_batch_size, bm25_lemmatize, score_order, quality_depth, quality_weights, artifacts):
+    def __init__(self, *, repo_path, data_path, dense_index_dir, dense_models, seed, sample_seed, n_val, n_test, ns, ks, select_k, query_batch_size, dense_batch_size, bm25_lemmatize, score_order, quality_depth, quality_weights, artifacts, dense_max_length=128, build_dense_indices=True):
         self.root = repo_path
         self.data_path = data_path
         self.dense_index_dir = dense_index_dir
@@ -31,6 +31,8 @@ class RetrievalComparison:
         self.select_k = select_k
         self.query_batch_size = query_batch_size
         self.dense_batch_size = dense_batch_size
+        self.dense_max_length = dense_max_length
+        self.build_dense_indices = build_dense_indices
         self.bm25_lemmatize = bm25_lemmatize
         self.score_order = score_order
         self.quality_depth = quality_depth
@@ -62,21 +64,22 @@ class RetrievalComparison:
         if (missing := (required - set(pl.read_parquet_schema(self.data_path)))):
             raise ValueError(f'В train.parquet отсутствуют {missing}')
         if self.dense_models and self.dense_index_dir is None:
-            candidates = [self.root / 'dense_indexes', Path('/kaggle/working/dense_indexes')]
-            candidates += [p.parent.parent for p in Path('/kaggle/input').rglob('index.faiss')]
-            candidates = list({p.resolve() for p in candidates if all(((p / name / 'index.faiss').is_file() for name in self.dense_models))})
-            if len(candidates) != 1:
-                raise ValueError('Укажите DENSE_INDEX_DIR с папками моделей giga/ и bge/.')
-            self.dense_index_dir = candidates[0]
+            roots = [p.parent.parent for p in Path('/kaggle/input').rglob('index.faiss')]
+            roots = list({p.resolve() for p in roots if all(
+                (p / name / 'index.faiss').is_file() and (p / name / 'metadata.json').is_file()
+                for name in self.dense_models)})
+            if len(roots) > 1:
+                raise ValueError(f'Несколько папок с dense-индексами: {roots}. Укажите DENSE_INDEX_DIR.')
+            if roots:
+                self.dense_index_dir = roots[0]
+            else:
+                self.dense_index_dir = (Path('/kaggle/working/retrieval_comparison/dense_indexes')
+                                        if Path('/kaggle/working').is_dir()
+                                        else self.artifacts / 'dense_indexes')
+        if self.dense_index_dir is not None:
+            self.dense_index_dir = Path(self.dense_index_dir)
+            self.dense_index_dir.mkdir(parents=True, exist_ok=True)
         self.dense_metadata = {}
-        for name in self.dense_models:
-            path = Path(self.dense_index_dir) / name
-            raw = (path / 'metadata.json').read_bytes()
-            params = json.loads(raw)['params']
-            if params['model'] != name or params['item_text_column'] != 'item_title_raw' or params['query_text_column'] != 'search_query':
-                raise ValueError(f'{name}: требуется индекс query → title.')
-            stat = (path / 'index.faiss').stat()
-            self.dense_metadata[name] = [hashlib.sha256(raw).hexdigest(), stat.st_size, stat.st_mtime_ns]
         print('Код:', self.root, 'Данные:', self.data_path, 'Индексы:', self.dense_index_dir)
 
     def read_item_text(self, column):
@@ -116,6 +119,43 @@ class RetrievalComparison:
             print(split, 'источник центра:')
             display(q.center_source.value_counts(dropna=False))
         self.prepare_quality()
+
+    def prepare_dense_indices(self):
+        """Build and cache each item index on the Kaggle GPU; reuse it on reruns."""
+        if not self.dense_models:
+            return
+        from src.retrievers.dense import DenseRetriever
+        import torch
+        corpus = self.read_item_text('item_title_raw')
+        expected = corpus.loc[corpus.item_title_raw.fillna('').str.strip().ne(''), 'item_id'].tolist()
+        for name in self.dense_models:
+            path = self.dense_index_dir / name
+            if (path / 'index.faiss').is_file() and (path / 'metadata.json').is_file():
+                model = DenseRetriever.load(path, device='cuda')
+                if (model.model != name or model.item_text_column != 'item_title_raw'
+                        or model.query_text_column != 'search_query' or model.max_length != self.dense_max_length):
+                    raise ValueError(f'{path}: параметры индекса не совпадают; удалите этот индекс или задайте новый DENSE_INDEX_DIR.')
+                if model.item_ids_.tolist() != expected:
+                    raise ValueError(f'{path}: корпус отличается; задайте новый DENSE_INDEX_DIR.')
+                print(name, '— индекс уже есть:', path)
+            else:
+                if not self.build_dense_indices:
+                    raise FileNotFoundError(f'{path}: индекс отсутствует. Включите BUILD_DENSE_INDEXES для построения на Kaggle.')
+                model = DenseRetriever(model=name, item_text_column='item_title_raw',
+                    query_text_column='search_query', device='cuda', batch_size=self.dense_batch_size,
+                    max_length=self.dense_max_length, show_progress=True)
+                print(name, '— кодирую объявления на Kaggle GPU')
+                model.fit(corpus)
+                model.save(path)
+                print(name, '— индекс сохранён:', path)
+            del model
+            gc.collect()
+            torch.cuda.empty_cache()
+            raw = (path / 'metadata.json').read_bytes()
+            stat = (path / 'index.faiss').stat()
+            self.dense_metadata[name] = [hashlib.sha256(raw).hexdigest(), stat.st_size, stat.st_mtime_ns]
+        del corpus, expected
+        gc.collect()
 
     def prepare_quality(self):
         self.quality = pd.DataFrame(index=self.items.item_id)
