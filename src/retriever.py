@@ -69,6 +69,7 @@ class Retriever(BaseEstimator, ABC):
 
     @staticmethod
     def _candidate_query_indices(queries: pd.DataFrame, candidates: pd.DataFrame) -> np.ndarray:
+        """Проверить query_index кандидатов и вернуть позиции целыми числами."""
         if missing := {"query_index", "item_id"}.difference(candidates.columns):
             raise ValueError(f"Missing candidate columns: {sorted(missing)}")
         if candidates[["query_index", "item_id"]].isna().any().any():

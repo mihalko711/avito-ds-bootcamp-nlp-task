@@ -12,6 +12,7 @@ def haversine(lat1, lon1, lat2, lon2):
     valid = (np.isfinite(lat1) & np.isfinite(lon1) & np.isfinite(lat2) & np.isfinite(lon2)
              & (np.abs(lat1) <= 90) & (np.abs(lat2) <= 90)
              & (np.abs(lon1) <= 180) & (np.abs(lon2) <= 180))
+    # Подставляем нули только для расчёта; в результате невалидные пары станут NaN.
     lat1, lon1, lat2, lon2 = [np.radians(np.where(valid, x, 0))
                             for x in (lat1, lon1, lat2, lon2)]
     a = np.sin((lat2 - lat1) / 2) ** 2 + np.cos(lat1) * np.cos(lat2) * np.sin((lon2 - lon1) / 2) ** 2
@@ -42,6 +43,7 @@ def location_centers(train: pd.DataFrame) -> pd.DataFrame:
         centers["center_source"] = source
         return centers
 
+    # Fallback заполняет только локации без центра; два источника не смешиваются.
     primary = aggregate("item_location_id", ["item_id"], "item_location")
     fallback = aggregate("search_location_id", ["search_location_id", "item_id"], "search_location")
     return pd.concat([primary, fallback.loc[~fallback.index.isin(primary.index)]]).sort_index()

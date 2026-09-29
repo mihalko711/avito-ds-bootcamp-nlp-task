@@ -58,6 +58,7 @@ class DenseRetriever(Retriever):
         revision: str | None = None,
         show_progress: bool = True,
     ) -> None:
+        """Задать модель, поля текста и параметры кодирования/поиска."""
         self.model = model
         self.item_text_column = item_text_column
         self.query_text_column = query_text_column
@@ -70,6 +71,7 @@ class DenseRetriever(Retriever):
         self.show_progress = show_progress
 
     def _validate_params(self):
+        """Проверить имя модели и настройки, влияющие на создание индекса."""
         if self.model not in MODELS:
             raise ValueError(f"model must be one of {tuple(MODELS)}")
         if self.dtype not in {"auto", "float32", "float16", "bfloat16"}:
@@ -81,6 +83,7 @@ class DenseRetriever(Retriever):
 
     @staticmethod
     def _texts(frame, column):
+        """Вернуть текстовое поле как список строк, заменив пропуски пустыми строками."""
         if column not in frame.columns:
             raise ValueError(f"Missing text column: {column}")
         texts = frame[column].fillna("").tolist()
@@ -89,6 +92,7 @@ class DenseRetriever(Retriever):
         return texts
 
     def _load_encoder(self):
+        """Загрузить SentenceTransformer на выбранном устройстве и задать лимит длины."""
         import torch
         from sentence_transformers import SentenceTransformer
 
@@ -107,6 +111,7 @@ class DenseRetriever(Retriever):
         return encoder
 
     def _encode(self, texts, *, query):
+        """Кодировать строки в нормированные float32-векторы; для Giga добавить инструкцию."""
         prompt = ""
         if query and self.model == "giga":
             prompt = f"Instruct: {self.query_instruction}\nQuery: "
@@ -123,10 +128,12 @@ class DenseRetriever(Retriever):
             raise ValueError("Encoder returned invalid embeddings.")
         if np.any(np.linalg.norm(vectors, axis=1) == 0):
             raise ValueError("Encoder returned a zero vector.")
+        # Повторная нормировка после float32-преобразования сохраняет cosine-поиск в FAISS.
         faiss.normalize_L2(vectors)
         return vectors
 
     def fit(self, items: pd.DataFrame) -> Self:
+        """Порциями закодировать непустые объявления и построить точный FAISS inner-product индекс."""
         from tqdm.auto import tqdm
 
         self._validate_params()
@@ -159,6 +166,7 @@ class DenseRetriever(Retriever):
         return self
 
     def _check_index(self):
+        """Убедиться, что индекс построен и параметры векторного пространства не менялись."""
         check_is_fitted(self, ["index_", "item_ids_"])
         self._validate_params()
         # Эти настройки меняют пространство векторов: после их изменения
@@ -168,6 +176,7 @@ class DenseRetriever(Retriever):
                 raise ValueError(f"{name} changed after fit; rebuild the index.")
 
     def retrieve(self, queries: pd.DataFrame, *, k: int) -> pd.DataFrame:
+        """Закодировать запросы и вернуть top-k ближайших векторов объявлений."""
         self._check_index()
         if isinstance(k, bool) or not isinstance(k, int) or k < 1:
             raise ValueError("k must be a positive integer.")
@@ -200,6 +209,7 @@ class DenseRetriever(Retriever):
         texts = self._texts(queries, self.query_text_column)
         positions = pd.Index(self.item_ids_).get_indexer(candidates.item_id)
         scores = np.full(len(candidates), np.nan)
+        # Кодируем только запросы, у которых есть непустой текст и хотя бы один item в индексе.
         active = [i for i in np.unique(query_indices[positions >= 0]) if texts[i].strip()]
         if not active:
             return scores
@@ -212,12 +222,13 @@ class DenseRetriever(Retriever):
                 rows = np.flatnonzero((query_indices == query_i) & (positions >= 0))
                 for offset in range(0, len(rows), 4096):
                     selected = rows[offset:offset + 4096]
+                    # Ограничиваем временную копию FAISS-векторов для больших candidate pools.
                     item_vectors = self.index_.reconstruct_batch(positions[selected])
                     scores[selected] = item_vectors @ vector
         return scores
 
     def save(self, directory: str | Path) -> None:
-        """Сохранить индекс (включая векторы) и настройки; без весов модели."""
+        """Сохранить FAISS-векторы, порядок item_id и настройки; веса энкодера не сохраняются."""
         check_is_fitted(self, ["index_", "item_ids_"])
         path = Path(directory)
         path.mkdir(parents=True, exist_ok=True)
@@ -231,7 +242,7 @@ class DenseRetriever(Retriever):
 
     @classmethod
     def load(cls, directory: str | Path, *, device: str | None = None) -> Self:
-        """Восстановить индекс; device=None автоматически выбирает устройство."""
+        """Восстановить индекс без кодирования корпуса; энкодер загрузится при первом поиске."""
         path = Path(directory)
         metadata = json.loads((path / "metadata.json").read_text(encoding="utf-8"))
         params = metadata["params"]

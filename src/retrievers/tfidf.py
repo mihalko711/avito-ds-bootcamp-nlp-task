@@ -13,6 +13,7 @@ from src.retrievers.bm25 import RussianTokenizer
 
 
 def _normalize(text: str) -> str:
+    """Нормализовать регистр и Unicode для символьного анализатора."""
     return unicodedata.normalize("NFC", text).lower().replace("ё", "е")
 
 
@@ -40,6 +41,7 @@ class TfidfRetriever(Retriever):
         sublinear_tf: bool = False,
         batch_size: int = 32,
     ) -> None:
+        """Задать поля текста, анализатор, n-граммы и параметры TF-IDF."""
         self.item_text_column = item_text_column
         self.query_text_column = query_text_column
         self.analyzer = analyzer
@@ -52,6 +54,7 @@ class TfidfRetriever(Retriever):
         self.batch_size = batch_size
 
     def fit(self, items: pd.DataFrame) -> Self:
+        """Обучить словарь и построить CSR-матрицу объявлений."""
         missing = {"item_id", self.item_text_column}.difference(items.columns)
         if missing:
             raise ValueError(f"Missing item columns: {sorted(missing)}")
@@ -89,6 +92,7 @@ class TfidfRetriever(Retriever):
         return self
 
     def retrieve(self, queries: pd.DataFrame, *, k: int) -> pd.DataFrame:
+        """Посчитать cosine TF-IDF и вернуть до k положительных совпадений на запрос."""
         check_is_fitted(self, ["vectorizer_", "item_vectors_", "item_ids_"])
         if self.query_text_column not in queries.columns:
             raise ValueError(f"Missing query column: {self.query_text_column}")
@@ -109,6 +113,7 @@ class TfidfRetriever(Retriever):
                 valid = np.isfinite(values) & (values > 0)
                 doc_ids, values = doc_ids[valid], values[valid]
                 if len(values) > k:
+                    # Порог уменьшает сортировку до top-k и сохраняет все ничьи на границе.
                     cutoff = np.partition(values, -k)[-k]
                     eligible = np.flatnonzero(values >= cutoff)
                 else:

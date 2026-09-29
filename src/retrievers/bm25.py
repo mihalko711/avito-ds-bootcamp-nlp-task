@@ -31,15 +31,18 @@ class RussianTokenizer:
     """
 
     def __init__(self, *, lemmatize: bool = False) -> None:
+        """Создать токенизатор; морфологический анализатор нужен только для лемм."""
         self.lemmatize = lemmatize
         self._morph = MorphAnalyzer() if lemmatize else None
 
     @lru_cache(maxsize=100_000)
     def _lemma(self, word: str) -> str:
+        """Вернуть частотную нормальную форму слова с ограниченным кешем."""
         assert self._morph is not None
         return self._morph.parse(word)[0].normal_form.replace("ё", "е")
 
     def tokenize(self, text: str) -> list[str]:
+        """Нормализовать строку и вернуть слова, сохраняя числа и марки."""
         if not isinstance(text, str):
             raise ValueError("Text must be a string; use an empty string for missing text.")
         normalized = unicodedata.normalize("NFC", text).lower().replace("ё", "е")
@@ -72,6 +75,7 @@ class BM25Retriever(Retriever):
         b: float = 0.75,
         batch_size: int = 256,
     ) -> None:
+        """Задать текстовые поля, BM25-параметры и размер батча."""
         self.item_text_column = item_text_column
         self.query_text_column = query_text_column
         self.lemmatize = lemmatize
@@ -80,6 +84,7 @@ class BM25Retriever(Retriever):
         self.batch_size = batch_size
 
     def fit(self, items: pd.DataFrame) -> Self:
+        """Построить BM25S-индекс по уникальным item_id из указанного поля."""
         required = {"item_id", self.item_text_column}
         missing = required.difference(items.columns)
         if missing:
@@ -115,6 +120,7 @@ class BM25Retriever(Retriever):
         return self
 
     def retrieve(self, queries: pd.DataFrame, *, k: int) -> pd.DataFrame:
+        """Вернуть до k совпавших объявлений; пустые токенизированные запросы пропустить."""
         check_is_fitted(self, ["index_", "item_ids_", "tokenizer_"])
         required = {self.query_text_column}
         missing = required.difference(queries.columns)

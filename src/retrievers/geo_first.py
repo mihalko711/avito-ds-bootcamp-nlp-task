@@ -40,6 +40,7 @@ class GeoFirstRetriever(Retriever):
     def __init__(self, retrievers: dict[str, Retriever] | None = None, *, n_candidates: int = 500,
                  fusion: str = "sum", score_order: tuple[str, ...] | None = None,
                  weights: dict[str, float] | None = None) -> None:
+        """Задать размер геопула и правило объединения текстовых скоров."""
         self.retrievers = retrievers
         self.n_candidates = n_candidates
         self.fusion = fusion
@@ -47,6 +48,7 @@ class GeoFirstRetriever(Retriever):
         self.weights = weights
 
     def _validate_params(self):
+        """Проверить размер пула и режим fusion."""
         if isinstance(self.n_candidates, bool) or not isinstance(self.n_candidates, int) or self.n_candidates < 1:
             raise ValueError("n_candidates must be a positive integer.")
         if self.fusion not in {"tuple", "sum", "distance"}:
@@ -77,7 +79,7 @@ class GeoFirstRetriever(Retriever):
         centers, inverse = np.unique(np.radians(coords[active]), axis=0, return_inverse=True)
         k = min(self.n_candidates, len(self.item_ids_))
         distances, _ = self.tree_.query(centers, k=k)
-        # Включаем все ничьи на границе top-N: префиксы при разных N совпадают.
+        # Радиусный запрос возвращает ничьи на границе; сортировка ниже даёт стабильный top-N.
         neighbors, distances = self.tree_.query_radius(
             centers, r=distances[:, -1] + 1e-12, return_distance=True,
         )
@@ -114,6 +116,7 @@ class GeoFirstRetriever(Retriever):
             else:
                 low = out.groupby("query_index")[names].transform("min")
                 span = out.groupby("query_index")[names].transform("max") - low
+                # Константный скор не различает кандидатов, поэтому его вклад равен нулю.
                 normalized = ((out[names] - low) / span.replace(0, np.nan)).fillna(0)
                 weights = np.array([(self.weights or {}).get(name, 1.0) for name in names])
                 if not np.isfinite(weights).all() or (weights < 0).any():
@@ -128,6 +131,7 @@ class GeoFirstRetriever(Retriever):
         return out[RESULT_COLUMNS].reset_index(drop=True)
 
     def retrieve(self, queries: pd.DataFrame, *, k: int) -> pd.DataFrame:
+        """Собрать ближайшую геопул, посчитать скоры моделями и вернуть top-k."""
         scored = self.candidates(queries)
         if self.fusion != "distance":
             if not self.retrievers:

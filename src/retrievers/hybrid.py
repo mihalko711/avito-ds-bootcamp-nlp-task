@@ -53,6 +53,7 @@ class HybridRetriever(Retriever):
         distance_scale_km: float = 100,
         distance_only: bool = False,
     ) -> None:
+        """Задать готовые retrievers, глубину их выдач и веса геопоправок."""
         self.retrievers = retrievers
         self.n_candidates = n_candidates
         self.rrf_constant = rrf_constant
@@ -62,6 +63,7 @@ class HybridRetriever(Retriever):
         self.distance_only = distance_only
 
     def _validate_params(self):
+        """Проверить глубину, RRF-константу и параметры геобонуса."""
         if isinstance(self.n_candidates, bool) or not isinstance(self.n_candidates, int) or self.n_candidates < 1:
             raise ValueError("n_candidates must be a positive integer.")
         for name in ("rrf_constant", "location_weight", "distance_weight"):
@@ -111,6 +113,7 @@ class HybridRetriever(Retriever):
 
         combined = (pd.concat(parts, ignore_index=True)
                     .groupby(["query_index", "item_id"], sort=False, as_index=False)["text_score"].sum())
+        # Нормировка делает максимальный RRF равным 1 для каждого запроса.
         combined["text_score"] /= combined.groupby("query_index")["text_score"].transform("max")
         positions = self.items_.index.get_indexer(combined.item_id)
         if (positions < 0).any():
@@ -146,6 +149,7 @@ class HybridRetriever(Retriever):
         return out[RESULT_COLUMNS].reset_index(drop=True)
 
     def retrieve(self, queries: pd.DataFrame, *, k: int) -> pd.DataFrame:
+        """Получить выдачи всех моделей, объединить кандидатов и применить геореранжирование."""
         check_is_fitted(self, ["items_"])
         self._validate_params()
         if not self.retrievers:

@@ -60,6 +60,7 @@ def split_queries(
 
     shuffled = np.random.default_rng(seed).permutation(groups)
     assignments = dict.fromkeys(shuffled, "train")
+    # Сначала резервируем test, затем val; train получает оставшиеся группы.
     assignments.update(dict.fromkeys(shuffled[:n_test], "test"))
     assignments.update(dict.fromkeys(shuffled[n_test : n_test + n_val], "val"))
     return np.array([assignments[group] for group in normalized], dtype="<U5")
